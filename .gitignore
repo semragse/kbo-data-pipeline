@@ -1,0 +1,25 @@
+# Données CSV KBO (trop volumineux pour Git)
+*.csv
+
+# PDFs téléchargés
+tmp/
+*.pdf
+
+# Cookies sensibles
+notaire_cookies.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# VS Code
+.vscode/
+
+# Word docs
+*.docx
