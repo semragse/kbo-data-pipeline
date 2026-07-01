@@ -1,67 +1,60 @@
 """
-INGESTION BRONZE — KBO Open Data → MongoDB
-==========================================
-Charge les 9 fichiers CSV KBO dans la base MongoDB `kbo_bronze`.
-Chaque fichier CSV devient une collection distincte (couche Bronze = données brutes).
+INGESTION BRONZE — KBO Open Data CSV → MongoDB (enterprise_finale)
+===================================================================
+Lit les CSV KBO Open Data et produit directement UNE SEULE collection
+`enterprise_finale` : un document complet par entreprise contenant
+TOUTES les informations issues de tous les CSV (jointure sur
+EnterpriseNumber / EntityNumber).
 
-Collections créées :
-  - enterprise      (EnterpriseNumber, Status, JuridicalForm, ...)
-  - denomination    (EntityNumber, Language, TypeOfDenomination, Denomination)
-  - address         (EntityNumber, TypeOfAddress, Zipcode, Municipality, ...)
-  - activity        (EntityNumber, ActivityGroup, NaceVersion, NaceCode, ...)
-  - contact         (EntityNumber, ContactType, Value)
-  - establishment   (EstablishmentNumber, StartDate, EnterpriseNumber)
-  - branch          (Id, StartDate, EnterpriseNumber)
-  - code            (Category, Code, Language, Description)
-  - meta            (Variable, Value)
+Structure de chaque document :
+{
+  "EnterpriseNumber": "0878.065.378",
+  "Status": "AC",
+  "JuridicalForm": "416",
+  ...                              ← champs enterprise de base
+  "denominations":  [...],         ← tous les noms (FR/NL)
+  "addresses":      [...],         ← toutes les adresses
+  "activities":     [...],         ← toutes les activités NACE
+  "contacts":       [...],         ← téléphones, emails, web
+  "establishments": [...],         ← établissements
+  "branches":       [...]          ← succursales étrangères
+}
+
+Stratégie mémoire (streaming merge-join) :
+  Les fichiers enterprise/denomination/address/activity/contact/branch
+  sont triés par numéro d'entité → jointure par fusion en O(n), mémoire
+  constante même avec 34 M lignes d'activités.
+  establishment.csv n'est pas trié → pré-trié en mémoire une seule fois.
 
 Usage :
   python ingest_bronze.py
+  python ingest_bronze.py --limit 5000   # test sur un échantillon
 """
 
+from __future__ import annotations
+
+import argparse
+import csv
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
+from typing import Iterator
 
-import pandas as pd
 from dotenv import load_dotenv
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import BulkWriteError
+from pymongo import ASCENDING, MongoClient
+from tqdm import tqdm
 
 load_dotenv()
 
-# ── Configuration ──────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 
-MONGO_URI   = os.getenv("MONGO_URI", "mongodb://admin:admin123@localhost:27017/")
-DB_NAME     = os.getenv("MONGO_DB", "kbo_bronze")
-DATA_DIR    = Path(os.getenv("KBO_DIR", str(Path(__file__).parent)))
-CHUNK_SIZE  = 50_000                         # lignes lues par batch (RAM safe)
-
-# Mapping fichier CSV → nom de collection MongoDB
-CSV_COLLECTIONS = {
-    "meta.csv":           "meta",
-    "code.csv":           "code",
-    "enterprise.csv":     "enterprise",
-    "denomination.csv":   "denomination",
-    "address.csv":        "address",
-    "contact.csv":        "contact",
-    "establishment.csv":  "establishment",
-    "branch.csv":         "branch",
-    "activity.csv":       "activity",   # 1.5 GB — traité en chunks
-}
-
-# Index utiles pour les requêtes futures (couche Silver/Gold)
-INDEXES = {
-    "enterprise":    [("EnterpriseNumber", ASCENDING)],
-    "denomination":  [("EntityNumber", ASCENDING)],
-    "address":       [("EntityNumber", ASCENDING)],
-    "activity":      [("EntityNumber", ASCENDING)],
-    "contact":       [("EntityNumber", ASCENDING)],
-    "establishment": [("EnterpriseNumber", ASCENDING)],
-    "branch":        [("EnterpriseNumber", ASCENDING)],
-    "code":          [("Category", ASCENDING), ("Code", ASCENDING)],
-}
+MONGO_URI  = os.getenv("MONGO_URI", "mongodb://admin:admin123@localhost:27017/")
+DB_NAME    = os.getenv("MONGO_DB",  "kbo_bronze")
+DATA_DIR   = Path(os.getenv("KBO_DIR", str(Path(__file__).parent)))
+COLLECTION = "enterprise_finale"
+BATCH_SIZE = 1_000
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -72,113 +65,207 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Colonnes conservées par table enfant ───────────────────────────────────────
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+_DENOM_COLS  = ["Language", "TypeOfDenomination", "Denomination"]
+_ADDR_COLS   = [
+    "TypeOfAddress", "CountryNL", "CountryFR", "Zipcode",
+    "MunicipalityNL", "MunicipalityFR", "StreetNL", "StreetFR",
+    "HouseNumber", "Box", "ExtraAddressInfo", "DateStrikingOff",
+]
+_ACT_COLS    = ["ActivityGroup", "NaceVersion", "NaceCode", "Classification"]
+_CONT_COLS   = ["EntityContact", "ContactType", "Value"]
+_ESTAB_COLS  = ["EstablishmentNumber", "StartDate"]
+_BRANCH_COLS = ["StartDate"]
 
-def clean_record(record: dict) -> dict:
-    """Supprime les valeurs NaN/None pour alléger les documents MongoDB."""
-    return {k: v for k, v in record.items() if pd.notna(v) and v != ""}
 
+# ── Streaming child reader (merge-join) ────────────────────────────────────────
 
-def ingest_csv(collection, csv_path: Path) -> int:
+class _ChildStream:
     """
-    Lit un CSV en chunks et insère les documents dans la collection MongoDB.
-    Retourne le nombre total de documents insérés.
+    Lit un CSV enfant trié par clé et renvoie via take(target)
+    toutes les lignes dont la clé == target, en avançant le curseur.
+    Les clés orphelines (< target) sont ignorées silencieusement.
     """
-    total_inserted = 0
-    chunk_num = 0
 
-    for chunk in pd.read_csv(
-        csv_path,
-        dtype=str,
-        keep_default_na=False,
-        chunksize=CHUNK_SIZE,
-        encoding="utf-8",
-    ):
-        chunk_num += 1
-        records = [clean_record(r) for r in chunk.to_dict("records")]
+    def __init__(self, path: Path, key: str, cols: list[str]):
+        self._f      = open(path, newline="", encoding="utf-8")
+        self._reader = csv.DictReader(self._f)
+        self._key    = key
+        self._cols   = cols
+        self._cur: dict | None = None
+        self._advance()
 
-        try:
-            result = collection.insert_many(records, ordered=False)
-            total_inserted += len(result.inserted_ids)
-        except BulkWriteError as e:
-            # Certains docs peuvent être dupliqués si on re-exécute le script
-            inserted = e.details.get("nInserted", 0)
-            total_inserted += inserted
-            log.warning(f"    BulkWriteError chunk {chunk_num}: {inserted} insérés, erreurs ignorées")
+    def _advance(self) -> None:
+        self._cur = next(self._reader, None)
 
-        log.info(f"    chunk {chunk_num:>4} — {total_inserted:>10,} docs insérés")
+    @staticmethod
+    def _clean(v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        return s or None
 
-    return total_inserted
+    def take(self, target: str) -> list[dict]:
+        # Sauter les orphelins (clé < target)
+        while self._cur is not None and self._cur[self._key] < target:
+            self._advance()
+        rows: list[dict] = []
+        while self._cur is not None and self._cur[self._key] == target:
+            rows.append({c: self._clean(self._cur.get(c)) for c in self._cols})
+            self._advance()
+        return rows
+
+    def close(self) -> None:
+        self._f.close()
+
+
+# ── Pré-tri de establishment.csv ───────────────────────────────────────────────
+
+def _sort_establishments(src: Path, tmp_dir: str) -> Path:
+    """
+    establishment.csv n'est pas trié par EnterpriseNumber.
+    On le trie une fois dans un fichier temporaire pour pouvoir
+    le consommer en merge-join (mémoire constante pendant l'ingestion).
+    """
+    log.info("  Pré-tri establishment.csv par EnterpriseNumber...")
+    rows: list[tuple[str, str, str]] = []
+    with open(src, newline="", encoding="utf-8") as f:
+        for row in tqdm(csv.DictReader(f), desc="    tri établissements",
+                        unit=" lignes", leave=False):
+            rows.append((
+                row.get("EnterpriseNumber", ""),
+                row.get("EstablishmentNumber", "") or "",
+                row.get("StartDate", "") or "",
+            ))
+    rows.sort(key=lambda r: r[0])
+    out = Path(tmp_dir) / "establishment_sorted.csv"
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["EnterpriseNumber", "EstablishmentNumber", "StartDate"])
+        writer.writerows(rows)
+    rows.clear()   # libère la mémoire avant la fusion principale
+    return out
+
+
+# ── Générateur de documents Bronze ────────────────────────────────────────────
+
+def _iter_documents(data_dir: Path, tmp_dir: str,
+                    limit: int | None) -> Iterator[dict]:
+    """Parcourt enterprise.csv et joint toutes les tables enfants en streaming."""
+
+    est_sorted = _sort_establishments(data_dir / "establishment.csv", tmp_dir)
+
+    denom  = _ChildStream(data_dir / "denomination.csv",  "EntityNumber",     _DENOM_COLS)
+    addr   = _ChildStream(data_dir / "address.csv",       "EntityNumber",     _ADDR_COLS)
+    act    = _ChildStream(data_dir / "activity.csv",      "EntityNumber",     _ACT_COLS)
+    cont   = _ChildStream(data_dir / "contact.csv",       "EntityNumber",     _CONT_COLS)
+    estab  = _ChildStream(est_sorted, "EnterpriseNumber", _ESTAB_COLS)
+    branch = _ChildStream(data_dir / "branch.csv",        "EnterpriseNumber", _BRANCH_COLS)
+
+    def _c(v: str | None) -> str | None:
+        return v.strip() or None if v else None
+
+    try:
+        with open(data_dir / "enterprise.csv", newline="", encoding="utf-8") as f:
+            for i, row in enumerate(csv.DictReader(f)):
+                if limit is not None and i >= limit:
+                    break
+                num = row["EnterpriseNumber"]
+                yield {
+                    "_id":                num,
+                    "EnterpriseNumber":   num,
+                    "Status":             _c(row.get("Status")),
+                    "JuridicalSituation": _c(row.get("JuridicalSituation")),
+                    "TypeOfEnterprise":   _c(row.get("TypeOfEnterprise")),
+                    "JuridicalForm":      _c(row.get("JuridicalForm")),
+                    "JuridicalFormCAC":   _c(row.get("JuridicalFormCAC")),
+                    "StartDate":          _c(row.get("StartDate")),
+                    "denominations":      denom.take(num),
+                    "addresses":          addr.take(num),
+                    "activities":         act.take(num),
+                    "contacts":           cont.take(num),
+                    "establishments":     estab.take(num),
+                    "branches":           branch.take(num),
+                }
+    finally:
+        for stream in (denom, addr, act, cont, estab, branch):
+            stream.close()
 
 
 # ── Programme principal ────────────────────────────────────────────────────────
 
-def main():
-    log.info("=" * 60)
-    log.info("  INGESTION BRONZE — KBO Open Data → MongoDB")
-    log.info("=" * 60)
+def main(limit: int | None = None) -> None:
+    log.info("=" * 65)
+    log.info("  INGESTION BRONZE — KBO CSV → enterprise_finale (MongoDB)")
+    log.info("=" * 65)
+    log.info(f"  Source  : {DATA_DIR.resolve()}")
+    log.info(f"  MongoDB : {DB_NAME}.{COLLECTION}")
+    if limit:
+        log.info(f"  Limite  : {limit:,} entreprises (mode test)")
+    log.info("")
 
-    # Connexion MongoDB
-    log.info(f"Connexion à {MONGO_URI} ...")
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5_000)
     try:
         client.admin.command("ping")
-        log.info("  ✓ MongoDB accessible")
+        log.info("✓ MongoDB accessible")
     except Exception as e:
-        log.error(f"  ✗ Impossible de joindre MongoDB : {e}")
-        log.error("  → Vérifiez que le conteneur est bien démarré : podman-compose up -d")
+        log.error(f"✗ MongoDB inaccessible : {e}")
+        log.error("  → podman-compose up -d")
         return
 
-    db = client[DB_NAME]
-    log.info(f"Base de données : {DB_NAME}")
+    db   = client[DB_NAME]
+    coll = db[COLLECTION]
+
+    log.info(f"Suppression de '{COLLECTION}' existante (rebuild propre)...")
+    coll.drop()
     log.info("")
 
-    grand_total = 0
-    start_all = time.time()
+    start = time.time()
+    total = 0
+    batch: list[dict] = []
 
-    for filename, col_name in CSV_COLLECTIONS.items():
-        csv_path = DATA_DIR / filename
-        if not csv_path.exists():
-            log.warning(f"  Fichier introuvable, ignoré : {filename}")
-            continue
+    with tempfile.TemporaryDirectory(prefix="kbo_bronze_") as tmp:
+        for doc in tqdm(
+            _iter_documents(DATA_DIR, tmp, limit),
+            desc="  entreprises",
+            unit=" doc",
+        ):
+            batch.append(doc)
+            if len(batch) >= BATCH_SIZE:
+                coll.insert_many(batch, ordered=False)
+                total += len(batch)
+                batch.clear()
 
-        size_mb = csv_path.stat().st_size / (1024 ** 2)
-        log.info(f"▶  {filename}  ({size_mb:.1f} MB) → collection '{col_name}'")
+        if batch:
+            coll.insert_many(batch, ordered=False)
+            total += len(batch)
 
-        collection = db[col_name]
+    log.info("Création des index...")
+    coll.create_index([("Status",                    ASCENDING)])
+    coll.create_index([("TypeOfEnterprise",          ASCENDING)])
+    coll.create_index([("JuridicalForm",             ASCENDING)])
+    coll.create_index([("activities.NaceCode",       ASCENDING)])
+    coll.create_index([("activities.Classification", ASCENDING)])
 
-        # Vider la collection si elle existe déjà (idempotent)
-        existing = collection.count_documents({})
-        if existing > 0:
-            log.info(f"    Collection existante ({existing:,} docs) — suppression et réingestion...")
-            collection.drop()
-            collection = db[col_name]
-
-        t0 = time.time()
-        count = ingest_csv(collection, csv_path)
-        elapsed = time.time() - t0
-
-        # Créer les index après l'ingestion (plus rapide)
-        if col_name in INDEXES:
-            for index_field in INDEXES[col_name]:
-                collection.create_index([index_field])
-            log.info(f"    Index créés : {[f[0] for f in INDEXES[col_name]]}")
-
-        grand_total += count
-        log.info(f"    ✓ {count:,} documents  |  {elapsed:.1f}s")
-        log.info("")
-
-    elapsed_all = time.time() - start_all
-    log.info("=" * 60)
-    log.info(f"  TERMINÉ — {grand_total:,} documents au total")
-    log.info(f"  Durée totale : {elapsed_all:.0f}s")
-    log.info(f"  Base         : {DB_NAME}")
-    log.info(f"  Collections  : {list(db.list_collection_names())}")
-    log.info("=" * 60)
+    elapsed = time.time() - start
+    log.info("")
+    log.info("=" * 65)
+    log.info(f"  ✓ {COLLECTION} : {total:,} documents")
+    log.info(f"  Durée : {elapsed:.0f}s")
+    log.info("=" * 65)
 
     client.close()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Ingestion Bronze KBO — CSV → enterprise_finale (MongoDB)"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Nombre max d'entreprises à ingérer (utile pour tester)"
+    )
+    args = parser.parse_args()
+    main(limit=args.limit)
+
