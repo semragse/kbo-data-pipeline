@@ -20,18 +20,22 @@ Usage :
 """
 
 import logging
+import os
 import time
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import BulkWriteError
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+load_dotenv()
 
-MONGO_URI   = "mongodb://admin:admin123@localhost:27017/"
-DB_NAME     = "kbo_bronze"
-DATA_DIR    = Path(__file__).parent          # même dossier que ce script
+# ── Configuration ──────────────────────────────────────────────────────
+
+MONGO_URI   = os.getenv("MONGO_URI", "mongodb://admin:admin123@localhost:27017/")
+DB_NAME     = os.getenv("MONGO_DB", "kbo_bronze")
+DATA_DIR    = Path(os.getenv("KBO_DIR", str(Path(__file__).parent)))
 CHUNK_SIZE  = 50_000                         # lignes lues par batch (RAM safe)
 
 # Mapping fichier CSV → nom de collection MongoDB
