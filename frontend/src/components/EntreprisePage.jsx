@@ -19,7 +19,8 @@ export default function EntreprisePage({ data, onBack }) {
   // Activité principale
   const mainActivity = silver?.activities?.find(a => a.Classification === 'MAIN')
 
-  const years = gold?.years || []
+  const years    = gold?.years || []
+  const isHotel  = gold !== null && gold !== undefined   // présent dans hotel_gold = c'est un hôtel
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px 16px' }}>
@@ -50,6 +51,13 @@ export default function EntreprisePage({ data, onBack }) {
         </div>
       </div>
 
+      {/* Badge hôtel / non hôtel */}
+      {!isHotel && (
+        <div style={{ background: '#fff8c5', border: '1px solid #d4a017', borderRadius: 6, padding: '10px 16px', marginBottom: 16, fontSize: 14 }}>
+          ⚠️ Cette entreprise n'est pas répertoriée comme hôtel (NACE 55xxx). Les données financières ne sont pas disponibles.
+        </div>
+      )}
+
       {/* Sankey */}
       {years.length > 0 && (
         <div style={card}>
@@ -75,7 +83,7 @@ export default function EntreprisePage({ data, onBack }) {
       {/* Tableau des ratios */}
       <div style={card}>
         <h3 style={cardTitle}>Ratios financiers par exercice</h3>
-        <RatioTable years={years} />
+        <RatioTable years={years} isHotel={isHotel} />
       </div>
 
       {/* Contacts */}

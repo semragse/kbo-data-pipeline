@@ -22,9 +22,12 @@ const RATIOS = [
   { key: 'taux_endettement_pct', label: "Taux d'endettement",   fmt: pct },
 ]
 
-export default function RatioTable({ years }) {
-  if (!years || years.length === 0)
-    return <p style={{ color: '#888' }}>Aucun exercice financier disponible pour le moment.<br />Le scraping NBB est en cours…</p>
+export default function RatioTable({ years, isHotel }) {
+  if (!years || years.length === 0) {
+    if (!isHotel)
+      return <p style={{ color: '#888' }}>Cette entreprise n'appartient pas au secteur hôtelier (NACE 55xxx).<br />Seuls les hôtels disposent de ratios financiers.</p>
+    return <p style={{ color: '#888' }}>Exercices financiers en cours de récupération (scraping NBB).<br />Relancez <code>python build_gold.py</code> une fois le scraping terminé.</p>
+  }
 
   const sorted = [...years].sort((a, b) => b.year - a.year)
 
