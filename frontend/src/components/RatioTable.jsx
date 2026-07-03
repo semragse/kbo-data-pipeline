@@ -29,10 +29,19 @@ export default function RatioTable({ years, isHotel }) {
     return <p style={{ color: '#888' }}>Exercices financiers en cours de récupération (scraping NBB).<br />Relancez <code>python build_gold.py</code> une fois le scraping terminé.</p>
   }
 
+  // Vérifier si toutes les valeurs CA sont à 0 (PDFs téléchargés mais pas encore parsés)
+  const allZero = years.every(y => !y.chiffre_affaires || y.chiffre_affaires === 0)
+
   const sorted = [...years].sort((a, b) => b.year - a.year)
 
   return (
     <div style={{ overflowX: 'auto' }}>
+      {allZero && (
+        <div style={{ background: '#ddf4ff', border: '1px solid #54aeff', borderRadius: 6, padding: '8px 14px', marginBottom: 12, fontSize: 13 }}>
+          ℹ️ Les dépôts NBB ({years.map(y => y.year).join(', ')}) ont été téléchargés en PDF.
+          L'extraction des codes PCMN depuis les PDFs nécessite une clé API NBB structurée.
+        </div>
+      )}
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead>
           <tr style={{ background: '#f0f4f8' }}>

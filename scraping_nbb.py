@@ -37,7 +37,7 @@ MONGO_URI   = os.getenv("MONGO_URI", "mongodb://admin:admin123@localhost:27017/"
 DB_NAME     = os.getenv("MONGO_DB", "kbo_bronze")
 NBB_API_KEY = os.getenv("NBB_API_KEY", "")
 
-OUTPUT_DIR  = Path(os.getenv("NBB_OUTPUT_DIR", "tmp/nbb_deposits"))
+OUTPUT_DIR  = Path(os.getenv("NBB_OUTPUT_DIR", "tmp/hdfs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 NBB_BASE    = "https://consult.cbso.nbb.be/api"
@@ -199,32 +199,29 @@ def get_deposits(session: requests.Session, enterprise_number: str) -> list:
     raise RuntimeError(f"429 persistant pour {enterprise_number}")
 
 
-def download_pdf(session: requests.Session, enterprise_number: str, deposit: dict) -> Path | None:
-    """Télécharge le PDF d'un dépôt et le sauvegarde localement."""
-    deposit_id = deposit["id"]
-    year       = deposit.get("periodEndDateYear", "unknown")
-    reference  = deposit.get("reference", deposit_id)
-    dest       = OUTPUT_DIR / f"{enterprise_number}_{year}_{reference}.pdf"
-
+def download_csv(session: requests.Session, deposit_id: str,
+                 enterprise_number: str, year: int, reference: str) -> Path | None:
+    """Télécharge le CSV comptable PCMN d'un dépôt et le sauvegarde localement."""
+    safe_ref = reference.replace("/", "_")
+    dest = OUTPUT_DIR / enterprise_number / "nbb" / str(year) / f"{safe_ref}.csv"
     if dest.exists():
         return dest
 
+    url = f"{NBB_BASE}/external/broker/public/deposits/consult/csv/{deposit_id}"
     retries = 0
     while retries <= MAX_RETRIES_429:
-        r = session.get(
-            f"{NBB_BASE}/external/broker/public/deposits/pdf/{deposit_id}",
-            timeout=30,
-        )
+        r = session.get(url, timeout=30)
         if r.status_code == 429:
             retries += 1
-            log.warning(f"  429 PDF — attente {RETRY_AFTER_429}s")
+            log.warning(f"  429 CSV — attente {RETRY_AFTER_429}s")
             time.sleep(RETRY_AFTER_429)
             continue
         if r.status_code == 404:
             return None
         r.raise_for_status()
+        dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(r.content)
-        log.info(f"    ✓ {dest.name}  ({len(r.content)//1024} KB)")
+        log.info(f"    ✓ {dest.name}  ({len(r.content)} bytes)")
         return dest
 
     return None
@@ -268,18 +265,33 @@ def scrape(db):
             log.info(f"  {len(deposits)} dépôts >= {YEAR_MIN}")
 
             ok = 0
+            deposits_meta = {}   # { year: { metadata } }
             for dep in deposits:
-                pdf = download_pdf(session, bce, dep)
-                if pdf:
+                year      = dep.get("periodEndDateYear")
+                dep_id    = dep.get("id", "")
+                reference = str(dep.get("reference") or dep_id)
+                csv_path  = download_csv(session, dep_id, bce, year or 0, reference)
+                if csv_path:
                     ok += 1
+                # Sauvegarder les métadonnées de chaque exercice
+                if year:
+                    deposits_meta[str(year)] = {
+                        "id":           dep_id,
+                        "reference":    reference,
+                        "year":         year,
+                        "csv_path":     str(csv_path) if csv_path else None,
+                        "period_start": dep.get("periodStartDate"),
+                        "period_end":   dep.get("periodEndDate"),
+                    }
                 time.sleep(RATE_LIMIT_DELAY)
 
-            # Marquer done
+            # Marquer done + sauvegarder les métadonnées des dépôts
             col_state.update_one(
                 {"EnterpriseNumber": num},
                 {"$set": {
                     "status":        "done",
                     "filings_count": ok,
+                    "deposits":      deposits_meta,
                     "scraped_at":    datetime.utcnow(),
                     "error":         None,
                 }},
