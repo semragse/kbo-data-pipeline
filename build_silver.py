@@ -15,11 +15,14 @@ Usage :
   python build_silver.py
 """
 
+import csv
 import logging
 import os
 import time
+from pathlib import Path
+
 from dotenv import load_dotenv
-from pymongo import MongoClient, ASCENDING
+from pymongo import ASCENDING, MongoClient
 
 load_dotenv()
 
@@ -27,6 +30,7 @@ load_dotenv()
 
 MONGO_URI  = os.getenv("MONGO_URI", "mongodb://admin:admin123@localhost:27017/")
 DB_NAME    = os.getenv("MONGO_DB", "kbo_bronze")
+DATA_DIR   = Path(os.getenv("KBO_DIR", str(Path(__file__).parent)))
 BATCH_SIZE = 2_000
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -41,18 +45,29 @@ log = logging.getLogger(__name__)
 
 # ── Chargement du dictionnaire de codes (collection code) ─────────────────────
 
-def load_code_lookup(db) -> dict:
+def load_code_lookup(db=None) -> dict:
     """
-    Retourne { (Category, Code): { "FR": label, "NL": label } }
+    Lit code.csv et retourne { (Category, Code): { "FR": label, "NL": label } }
     Chargé en mémoire une seule fois (21k entrées ≈ léger).
     """
     lookup: dict[tuple, dict] = {}
-    for doc in db["code"].find({}, {"_id": 0, "Category": 1, "Code": 1, "Language": 1, "Description": 1}):
-        key = (doc["Category"], str(doc.get("Code", "")).strip())
-        if key not in lookup:
-            lookup[key] = {}
-        lookup[key][doc["Language"]] = doc["Description"]
-    log.info(f"  Code lookup chargé : {len(lookup):,} entrées")
+    code_csv = DATA_DIR / "code.csv"
+    if not code_csv.exists():
+        log.warning(f"  code.csv introuvable dans {DATA_DIR} — labels désactivés")
+        return lookup
+    with open(code_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            category = (row.get("Category") or "").strip()
+            code     = (row.get("Code")     or "").strip()
+            lang     = (row.get("Language") or "").strip()
+            desc     = (row.get("Description") or "").strip()
+            if not category or not code:
+                continue
+            key = (category, code)
+            if key not in lookup:
+                lookup[key] = {}
+            lookup[key][lang] = desc
+    log.info(f"  Code lookup chargé depuis code.csv : {len(lookup):,} entrées")
     return lookup
 
 
@@ -185,8 +200,8 @@ def main():
         return
 
     # Charger le dictionnaire de codes
-    log.info("Chargement du dictionnaire de codes...")
-    lookup = load_code_lookup(db)
+    log.info("Chargement du dictionnaire de codes depuis code.csv...")
+    lookup = load_code_lookup()
 
     # Préparer la collection Silver
     col_src = db["enterprise_finale"]
