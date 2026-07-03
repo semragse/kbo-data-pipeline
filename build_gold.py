@@ -112,10 +112,10 @@ def _div(num, den, factor=1.0):
     return round(num / den * factor, 2)
 
 
-def compute_ratios(acc: dict) -> dict:
+def compute_ratios(acc: dict, values: dict) -> dict:
     ca = acc.get("chiffre_affaires")
     return {
-        "marge_brute":          marge_brute(acc, {}),
+        "marge_brute":          marge_brute(acc, values),
         "marge_nette_pct":      _div(acc["resultat_net"],       ca,                       100),
         "roe_pct":              _div(acc["resultat_net"],       acc["fonds_propres"],     100),
         "liquidite":            _div(acc["tresorerie"],         acc["dettes_financieres"]),
@@ -151,7 +151,7 @@ def build_year(content: bytes, fallback_year: int | None = None) -> dict | None:
     return {
         "year":          year,
         **acc,
-        "ratios":        compute_ratios(acc),
+        "ratios":        compute_ratios(acc, values),
         "model_code":    meta.get("Model code"),
         "reference":     meta.get("Reference number"),
         "schema_type":   schema_type(values),
