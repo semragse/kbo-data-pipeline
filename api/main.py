@@ -187,9 +187,22 @@ async def get_entreprise(enterprise_number: str):
         {"_id": 0}
     )
 
+    # Liens avec d'autres entités (établissements frères via EnterpriseNumber)
+    linked = []
+    for est in silver.get("establishments", []):
+        est_num = est.get("EstablishmentNumber")
+        if est_num:
+            linked.append({"type": "établissement", "number": est_num,
+                           "start_date": est.get("StartDate")})
+    for br in silver.get("branches", []):
+        br_num = br.get("EnterpriseNumber")
+        if br_num:
+            linked.append({"type": "succursale", "number": br_num})
+
     return {
         "silver": silver,
         "gold":   gold,
+        "linked": linked,
     }
 
 

@@ -149,12 +149,16 @@ def build_year(content: bytes, fallback_year: int | None = None) -> dict | None:
         return None
     acc = extract_accounts(values)
     return {
-        "year":          year,
+        "year":                 year,
         **acc,
-        "ratios":        compute_ratios(acc, values),
-        "model_code":    meta.get("Model code"),
-        "reference":     meta.get("Reference number"),
-        "schema_type":   schema_type(values),
+        "ratios":               compute_ratios(acc, values),
+        "model_code":           meta.get("Model code"),
+        "reference":            meta.get("Reference number"),
+        "schema_type":          schema_type(values),
+        "period_start":         meta.get("Accounting period start date"),
+        "period_end":           meta.get("Accounting period end date"),
+        "general_assembly":     meta.get("General assembly date"),
+        "entity_name":          meta.get("Entity name"),
     }
 
 
